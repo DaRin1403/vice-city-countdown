@@ -54,6 +54,9 @@ internal sealed class Countdown : ApplicationContext
     private Preferences preferences;
     private string screenLayout;
     private long lastSeconds = -1;
+    private Stage lastStage;
+    private Stage preview;
+    private readonly Stopwatch previewClock = new Stopwatch();
 
     internal Countdown(FontFamily face)
     {
@@ -61,6 +64,17 @@ internal sealed class Countdown : ApplicationContext
         preferences = Preferences.Load();
         menu.Items.Add("编辑配置", null, (sender, args) => OpenPreferences());
         menu.Items.Add("重载配置", null, (sender, args) => ReloadPreferences());
+        var previews = new ToolStripMenuItem("预览动画");
+        AddPreview(previews, "整小时扫光", Stage.Hour);
+        AddPreview(previews, "六小时日落", Stage.Sunset);
+        AddPreview(previews, "最后一小时", Stage.FinalHour);
+        AddPreview(previews, "最后一分钟全屏表盘", Stage.Dial);
+        previews.DropDownItems.Add("结束预览", null, (sender, args) =>
+        {
+            previewClock.Reset();
+            Update();
+        });
+        menu.Items.Add(previews);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出倒计时", null, (sender, args) => ExitThread());
         tray = new NotifyIcon
@@ -74,6 +88,16 @@ internal sealed class Countdown : ApplicationContext
         timer.Tick += (sender, args) => Update();
         Update();
         timer.Start();
+    }
+
+    private void AddPreview(ToolStripMenuItem parent, string label, Stage stage)
+    {
+        parent.DropDownItems.Add(label, null, (sender, args) =>
+        {
+            preview = stage;
+            previewClock.Restart();
+            Update();
+        });
     }
 
     private static void OpenPreferences()
@@ -109,7 +133,11 @@ internal sealed class Countdown : ApplicationContext
     private void Update()
     {
         var remaining = preferences.Deadline - DateTimeOffset.UtcNow;
-        if (remaining.TotalSeconds < -10)
+        var previewElapsed = previewClock.Elapsed.TotalSeconds;
+        if (previewClock.IsRunning && previewElapsed >= StageFrame.PreviewLength(preview))
+            previewClock.Reset();
+        bool isPreview = previewClock.IsRunning;
+        if (!isPreview && remaining.TotalSeconds < -10)
         {
             if (screenLayout != string.Empty)
             {
@@ -119,22 +147,26 @@ internal sealed class Countdown : ApplicationContext
             }
             return;
         }
-        var seconds = Math.Max(0L, (long)Math.Ceiling(remaining.TotalSeconds));
-        if (seconds == lastSeconds) return;
-        lastSeconds = seconds;
+        var frame = isPreview ? StageFrame.Preview(preview, previewElapsed) : StageFrame.For(remaining.TotalSeconds);
+        timer.Interval = frame.Animated ? 50 : 150;
+        if (frame.Seconds == lastSeconds && frame.Kind == lastStage && !frame.Animated) return;
+        lastSeconds = frame.Seconds;
+        lastStage = frame.Kind;
 
         var selected = preferences.SelectScreens(Screen.AllScreens);
-        var layout = string.Join("|", selected.Select(screen => screen.DeviceName + screen.WorkingArea));
+        bool fullscreen = frame.Kind == Stage.Dial;
+        var layout = fullscreen + "|" + string.Join("|", selected.Select(screen =>
+            screen.DeviceName + (fullscreen ? screen.Bounds : screen.WorkingArea)));
         if (screenLayout != layout)
         {
             ClearOverlays();
-            foreach (var screen in selected) overlays.Add(new Overlay(screen.WorkingArea, face, preferences));
+            foreach (var screen in selected)
+                overlays.Add(new Overlay(fullscreen ? screen.Bounds : screen.WorkingArea, face, preferences, fullscreen));
             screenLayout = layout;
             tray.Text = "罪城倒计时 · " + preferences.DateLabel;
         }
 
-        var time = TimeSpan.FromSeconds(seconds);
-        foreach (var overlay in overlays) overlay.Draw(time);
+        foreach (var overlay in overlays) overlay.Draw(frame);
     }
 
     private void ClearOverlays()
@@ -235,17 +267,19 @@ internal sealed class Overlay : NativeWindow, IDisposable
 {
     private readonly Rectangle monitor;
     private readonly bool portrait;
+    private readonly bool fullscreen;
     private readonly Size canvas;
     private readonly FontFamily face;
     private readonly Preferences preferences;
 
-    internal Overlay(Rectangle bounds, FontFamily face, Preferences preferences)
+    internal Overlay(Rectangle bounds, FontFamily face, Preferences preferences, bool fullscreen = false)
     {
         monitor = bounds;
         this.face = face;
         this.preferences = preferences;
+        this.fullscreen = fullscreen;
         portrait = bounds.Height > bounds.Width;
-        canvas = new Size((int)(bounds.Width * (portrait ? .84 : .96)),
+        canvas = fullscreen ? bounds.Size : new Size((int)(bounds.Width * (portrait ? .84 : .96)),
             (int)(bounds.Width * (portrait ? .48 : .21)));
         CreateHandle(new CreateParams
         {
@@ -257,12 +291,12 @@ internal sealed class Overlay : NativeWindow, IDisposable
         });
     }
 
-    internal void Draw(TimeSpan remaining)
+    internal void Draw(StageFrame frame)
     {
-        using (var bitmap = Render(remaining)) Present(bitmap);
+        using (var bitmap = Render(frame)) Present(bitmap, frame.WithBaseAlpha(preferences.Alpha));
     }
 
-    internal Bitmap Render(TimeSpan remaining)
+    internal Bitmap Render(StageFrame frame)
     {
         var bitmap = new Bitmap(canvas.Width, canvas.Height, PixelFormat.Format32bppPArgb);
         try
@@ -271,21 +305,17 @@ internal sealed class Overlay : NativeWindow, IDisposable
             {
                 graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                var clock = remaining.ToString(@"hh\:mm\:ss");
-                var days = remaining.Days.ToString("00") + " DAY";
-                if (portrait)
-                {
-                    DrawText(graphics, days, canvas.Width * .29f, canvas.Height * .17f,
-                        canvas.Height * .18f);
-                    DrawText(graphics, clock, canvas.Width * .89f, canvas.Height * .51f,
-                        canvas.Height * .43f);
-                }
+                if (frame.Kind == Stage.Dial)
+                    StageArtwork.Dial(graphics, canvas, frame.Seconds, preferences.DateLabel, DrawText);
+                else if (frame.Kind == Stage.FinalHour)
+                    StageArtwork.FinalHour(graphics, canvas, frame, preferences.DateLabel, DrawText);
+                else if (frame.Kind == Stage.Sunset)
+                    StageArtwork.Sunset(graphics, canvas, frame, DrawText);
                 else
                 {
-                    DrawText(graphics, days + "   " + clock, canvas.Width * .96f,
-                        canvas.Height * .36f, canvas.Height * .69f);
+                    DrawRegular(graphics, TimeSpan.FromSeconds(frame.Seconds));
+                    if (frame.Kind == Stage.Hour) StageArtwork.Hour(graphics, canvas, frame);
                 }
-                DrawDate(graphics);
             }
             return bitmap;
         }
@@ -294,6 +324,21 @@ internal sealed class Overlay : NativeWindow, IDisposable
             bitmap.Dispose();
             throw;
         }
+    }
+
+    private void DrawRegular(Graphics graphics, TimeSpan remaining)
+    {
+        var clock = remaining.ToString(@"hh\:mm\:ss");
+        var days = remaining.Days.ToString("00") + " DAY";
+        if (portrait)
+        {
+            DrawText(graphics, days, canvas.Width * .29f, canvas.Height * .17f, canvas.Height * .18f);
+            DrawText(graphics, clock, canvas.Width * .89f, canvas.Height * .51f, canvas.Height * .43f);
+        }
+        else
+            DrawText(graphics, days + "   " + clock, canvas.Width * .96f, canvas.Height * .36f,
+                canvas.Height * .69f);
+        DrawDate(graphics);
     }
 
     private void DrawText(Graphics graphics, string label, float maxWidth, float centerY, float maxHeight)
@@ -350,18 +395,18 @@ internal sealed class Overlay : NativeWindow, IDisposable
         }
     }
 
-    private void Present(Bitmap bitmap)
+    private void Present(Bitmap bitmap, byte alpha)
     {
         var dc = Native.CreateCompatibleDC(IntPtr.Zero);
         var pixels = bitmap.GetHbitmap(Color.FromArgb(0));
         var previous = Native.SelectObject(dc, pixels);
         try
         {
-            var destination = new Point(monitor.Left + (monitor.Width - canvas.Width) / 2,
+            var destination = fullscreen ? monitor.Location : new Point(monitor.Left + (monitor.Width - canvas.Width) / 2,
                 monitor.Top + (int)(monitor.Height * .48) - canvas.Height / 2);
             var source = Point.Empty;
             var size = canvas;
-            var blend = new Native.Blend { Alpha = preferences.Alpha, UsePixelAlpha = 1 };
+            var blend = new Native.Blend { Alpha = alpha, UsePixelAlpha = 1 };
             if (!Native.UpdateLayeredWindow(Handle, IntPtr.Zero, ref destination, ref size,
                 dc, ref source, 0, ref blend, 2))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
